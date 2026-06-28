@@ -49,4 +49,4 @@ def setup_telemetry(app: FastAPI) -> None:
     )
     python_logging.getLogger().addHandler(otel_handler)
 
-    FastAPIInstrumentor.instrument_app(app)
+    FastAPIInstrumentor.instrument_app(app, excluded_urls="metrics,health")

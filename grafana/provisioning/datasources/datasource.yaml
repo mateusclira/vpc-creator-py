@@ -2,21 +2,34 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
 
   - name: Loki
+    uid: loki
     type: loki
     access: proxy
     url: http://loki:3100
+    jsonData:
+      # Log → Trace: extract trace_id from OTel structured metadata and link to Jaeger
+      derivedFields:
+        - name: TraceID
+          matcherType: label
+          matcherExpression: trace_id
+          url: "${__value.raw}"
+          urlDisplayLabel: "View Trace in Jaeger"
+          datasourceUid: jaeger
 
   - name: Jaeger
+    uid: jaeger
     type: jaeger
     access: proxy
     url: http://jaeger:16686
     jsonData:
+      # Trace → Log: from a trace span, jump to Loki logs with same trace_id
       tracesToLogsV2:
         datasourceUid: loki
         spanStartTimeShift: "-1m"

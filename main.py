@@ -50,13 +50,6 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
-    # Restore counters from persistent storage so they survive restarts.
-    vpcs_created = database.get_stat("vpcs_created")
-    vpcs_deleted = database.get_stat("vpcs_deleted")
-    if vpcs_created > 0:
-        metrics_module.VPCS_CREATED.inc(vpcs_created)
-    if vpcs_deleted > 0:
-        metrics_module.VPCS_DELETED.inc(vpcs_deleted)
     metrics_module.CURRENT_VPCS.set(len(database.list_vpcs()))
     yield
 
