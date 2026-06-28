@@ -52,6 +52,7 @@ def list_vpcs(path: str = DB_PATH) -> list:
         ).fetchall()
     return [_to_dict(r) for r in rows]
 
+
 def delete_vpc(vpc_id: str, path: str = DB_PATH) -> None:
     with sqlite3.connect(path) as conn:
         conn.execute("DELETE FROM vpcs WHERE id = ?", (vpc_id,))
