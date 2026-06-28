@@ -18,6 +18,7 @@ from jose import JWTError, jwt
 from pydantic import BaseModel, Field, field_validator, model_validator
 from prometheus_client import generate_latest
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from otel import setup_telemetry
 import database
@@ -49,6 +50,13 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
+    # Restore counters from persistent storage so they survive restarts.
+    vpcs_created = database.get_stat("vpcs_created")
+    vpcs_deleted = database.get_stat("vpcs_deleted")
+    if vpcs_created > 0:
+        metrics_module.VPCS_CREATED.inc(vpcs_created)
+    if vpcs_deleted > 0:
+        metrics_module.VPCS_DELETED.inc(vpcs_deleted)
     metrics_module.CURRENT_VPCS.set(len(database.list_vpcs()))
     yield
 
@@ -300,54 +308,80 @@ def login(body: LoginRequest) -> TokenResponse:
 
 @app.post("/vpcs", status_code=201, tags=["vpcs"])
 def create_vpc(body: VPCCreate, user: User) -> dict:
-    try:
-        vpc = _build_vpc(body)
-    except ClientError as exc:
-        logger.error("AWS error creating VPC: %s", exc)
-        metrics_module.AWS_ERRORS.inc()
-        raise HTTPException(
-            status_code=400, detail=exc.response["Error"]["Message"]
-        )
-    except BotoCoreError as exc:
-        logger.error("AWS connectivity error creating VPC: %s", exc)
-        metrics_module.AWS_ERRORS.inc()
-        raise HTTPException(status_code=502, detail=str(exc))
-    database.save_vpc(vpc)
-    metrics_module.VPCS_CREATED.inc()
-    metrics_module.CURRENT_VPCS.inc()
-    logger.info("VPC %s created by %s", vpc["aws_vpc_id"], user)
-    return vpc
+    with tracer.start_as_current_span("vpc.create") as span:
+        span.set_attribute("vpc.cidr", body.cidr)
+        span.set_attribute("vpc.region", body.region)
+        span.set_attribute("enduser.id", user)
+        try:
+            vpc = _build_vpc(body)
+        except ClientError as exc:
+            span.set_status(StatusCode.ERROR, exc.response["Error"]["Message"])
+            logger.error("AWS error creating VPC: %s", exc)
+            metrics_module.AWS_ERRORS.inc()
+            raise HTTPException(
+                status_code=400, detail=exc.response["Error"]["Message"]
+            )
+        except BotoCoreError as exc:
+            span.set_status(StatusCode.ERROR, str(exc))
+            logger.error("AWS connectivity error creating VPC: %s", exc)
+            metrics_module.AWS_ERRORS.inc()
+            raise HTTPException(status_code=502, detail=str(exc))
+        span.set_attribute("vpc.aws_id", vpc["aws_vpc_id"])
+        database.save_vpc(vpc)
+        database.increment_stat("vpcs_created")
+        metrics_module.VPCS_CREATED.inc()
+        metrics_module.CURRENT_VPCS.inc()
+        logger.info("VPC %s created by %s", vpc["aws_vpc_id"], user)
+        return vpc
 
 
 @app.get("/vpcs", tags=["vpcs"])
 def list_vpcs(user: User) -> list:
-    return database.list_vpcs()
+    with tracer.start_as_current_span("vpc.list") as span:
+        span.set_attribute("enduser.id", user)
+        vpcs = database.list_vpcs()
+        span.set_attribute("vpc.count", len(vpcs))
+        return vpcs
 
 
 @app.get("/vpcs/{vpc_id}", tags=["vpcs"])
 def get_vpc(vpc_id: str, user: User) -> dict:
-    vpc = database.get_vpc(vpc_id)
-    if vpc is None:
-        raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
-    return vpc
+    with tracer.start_as_current_span("vpc.get") as span:
+        span.set_attribute("vpc.id", vpc_id)
+        span.set_attribute("enduser.id", user)
+        vpc = database.get_vpc(vpc_id)
+        if vpc is None:
+            span.set_status(StatusCode.ERROR, "not found")
+            raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
+        span.set_attribute("vpc.aws_id", vpc["aws_vpc_id"])
+        return vpc
+
 
 @app.delete("/vpcs/{vpc_id}", status_code=204, tags=["vpcs"])
 def delete_vpc(vpc_id: str, user: User) -> None:
-    vpc = database.get_vpc(vpc_id)
-    if vpc is None:
-        raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
+    with tracer.start_as_current_span("vpc.delete") as span:
+        span.set_attribute("vpc.id", vpc_id)
+        span.set_attribute("enduser.id", user)
+        vpc = database.get_vpc(vpc_id)
+        if vpc is None:
+            span.set_status(StatusCode.ERROR, "not found")
+            raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
 
-    ec2 = boto3.Session().client("ec2", region_name=vpc["region"])
-    try:
-        _teardown_vpc(ec2, vpc["aws_vpc_id"], vpc["subnets"])
-    except ClientError as exc:
-        logger.error("AWS error deleting VPC %s: %s", vpc["aws_vpc_id"], exc)
-        raise HTTPException(
-            status_code=400, detail=exc.response["Error"]["Message"]
-        )
+        span.set_attribute("vpc.aws_id", vpc["aws_vpc_id"])
+        span.set_attribute("vpc.region", vpc["region"])
+        ec2 = boto3.Session().client("ec2", region_name=vpc["region"])
+        try:
+            _teardown_vpc(ec2, vpc["aws_vpc_id"], vpc["subnets"])
+        except ClientError as exc:
+            span.set_status(StatusCode.ERROR, exc.response["Error"]["Message"])
+            logger.error("AWS error deleting VPC %s: %s", vpc["aws_vpc_id"], exc)
+            raise HTTPException(
+                status_code=400, detail=exc.response["Error"]["Message"]
+            )
 
-    # Only remove from DB after AWS deletion succeeds.
-    database.delete_vpc(vpc_id)
-    metrics_module.VPCS_DELETED.inc()
+        # Only remove from DB after AWS deletion succeeds.
+        database.delete_vpc(vpc_id)
+        database.increment_stat("vpcs_deleted")
+        metrics_module.VPCS_DELETED.inc()
     metrics_module.CURRENT_VPCS.dec()
     logger.info("VPC %s deleted by %s", vpc["aws_vpc_id"], user)
