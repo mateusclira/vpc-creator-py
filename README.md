@@ -5,6 +5,21 @@ A minimal Python API that creates AWS VPCs using FastAPI, JWT authentication, an
 - disclaimer: AI was used to write tests and to update README
 ---
 
+
+## Grafana dashboard
+
+This repository includes a provisioned Grafana dashboard that visualizes VPC creation metrics, request latencies, and traces. Run Grafana
+
+Snapshot:
+
+![VPC Dashboard](images/grafana.png)
+
+**Highlights:**
+- Visualizes VPC creation and API metrics.
+- Shows request latency and tracing spans for troubleshooting.
+- Dashboard JSON is provisioned from [grafana/provisioning/dashboards/vpc-view.json](grafana/provisioning/dashboards/vpc-view.json).
+
+
 ## Project structure
 
 ```
