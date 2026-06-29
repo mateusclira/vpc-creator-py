@@ -3,6 +3,7 @@
 A minimal Python API that creates AWS VPCs using FastAPI, JWT authentication, and SQLite persistence. Costs **$0** to run.
 
 - disclaimer: AI was used to write tests and to update README
+- in observability-improves branch I'm also playing around with observability settings
 ---
 
 ## Project structure
