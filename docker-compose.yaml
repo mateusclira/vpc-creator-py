@@ -40,10 +40,19 @@ services:
 
   jaeger:
     image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    user: "0"
+    environment:
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
     ports:
       - "16686:16686"
       - "4317:4317"
       - "4318:4318"
+    volumes:
+      - jaeger-data:/badger
 
   loki:
     image: grafana/loki:3.5.0
@@ -60,3 +69,4 @@ volumes:
   prometheus-data:
   grafana-data:
   loki-data:
+  jaeger-data:
