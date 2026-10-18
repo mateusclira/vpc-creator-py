@@ -20,6 +20,37 @@ def init_db(path: str = DB_PATH) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stats (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        for key in ("vpcs_created", "vpcs_deleted"):
+            conn.execute(
+                "INSERT OR IGNORE INTO stats (key, value) VALUES (?, 0)", (key,)
+            )
+
+
+def get_stat(key: str, path: str = DB_PATH) -> int:
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            "SELECT value FROM stats WHERE key = ?", (key,)
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def increment_stat(key: str, path: str = DB_PATH) -> None:
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO stats (key, value) VALUES (?, 1)
+            ON CONFLICT(key) DO UPDATE SET value = value + 1
+            """,
+            (key,),
+        )
 
 
 def save_vpc(vpc: dict, path: str = DB_PATH) -> None:
@@ -51,6 +82,7 @@ def list_vpcs(path: str = DB_PATH) -> list:
             "SELECT * FROM vpcs ORDER BY created_at DESC"
         ).fetchall()
     return [_to_dict(r) for r in rows]
+
 
 def delete_vpc(vpc_id: str, path: str = DB_PATH) -> None:
     with sqlite3.connect(path) as conn:

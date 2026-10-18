@@ -10,13 +10,19 @@ from typing import Annotated, List
 
 import bcrypt
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import Response
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field, field_validator, model_validator
+from prometheus_client import generate_latest
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
+from otel import setup_telemetry
 import database
+import metrics as metrics_module
 
 # ---------------------------------------------------------------------------
 # Config
@@ -44,6 +50,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
+    metrics_module.CURRENT_VPCS.set(len(database.list_vpcs()))
     yield
 
 
@@ -73,6 +80,23 @@ def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+# ---------------------------------------------------------------------------
+# Metrics endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    return Response(
+        generate_latest(),
+        media_type="text/plain"
+    )
+
+# ----------------------------------------------------------------------------
+# OpenTelemetry instrumentation
+# ----------------------------------------------------------------------------
+
+setup_telemetry(app)
+tracer = trace.get_tracer(__name__)
 
 # ---------------------------------------------------------------------------
 # Models
@@ -129,12 +153,12 @@ class VPCCreate(BaseModel):
         seen: list[ipaddress.IPv4Network] = []
         for s in self.subnets:
             sub_net = ipaddress.ip_network(s.cidr, strict=True)
-            if not sub_net.subnet_of(vpc_net):
+            if not sub_net.subnet_of(vpc_net): # type: ignore
                 raise ValueError(f"Subnet {s.cidr} is not within VPC CIDR {self.cidr}")
             for existing in seen:
                 if sub_net.overlaps(existing):
                     raise ValueError(f"Subnet {s.cidr} overlaps with {existing}")
-            seen.append(sub_net)
+            seen.append(sub_net) # type: ignore
         for s in self.subnets:
             if not s.availability_zone.startswith(self.region):
                 raise ValueError(
@@ -159,36 +183,45 @@ class TokenResponse(BaseModel):
 
 
 def _build_vpc(body: VPCCreate) -> dict:
+    with tracer.start_as_current_span("build-vpc") as span:
+        span.set_attribute("aws.region", body.region)
+        span.set_attribute("vpc.cidr", body.cidr)
+        span.set_attribute("subnet.count", len(body.subnets))
+
     ec2 = boto3.Session().client("ec2", region_name=body.region)
     vpc_id: str | None = None
     igw_id: str | None = None
 
-    vpc_id = ec2.create_vpc(CidrBlock=body.cidr)["Vpc"]["VpcId"]
-    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
-    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+    try:
+        vpc_id = ec2.create_vpc(CidrBlock=body.cidr)["Vpc"]["VpcId"]
+        ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+        ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
 
-    igw_id = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
-    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+        igw_id = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
+        ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
 
-    rt_id = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
-    ec2.create_route(
-        RouteTableId=rt_id, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw_id
-    )
-
-    subnets = []
-    for s in body.subnets:
-        sub_id = ec2.create_subnet(
-            VpcId=vpc_id, CidrBlock=s.cidr, AvailabilityZone=s.availability_zone
-        )["Subnet"]["SubnetId"]
-        ec2.associate_route_table(RouteTableId=rt_id, SubnetId=sub_id)
-        subnets.append(
-            {"subnet_id": sub_id, "cidr": s.cidr, "availability_zone": s.availability_zone}
+        rt_id = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+        ec2.create_route(
+            RouteTableId=rt_id, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw_id
         )
 
-    ec2.create_tags(
-        Resources=[vpc_id, igw_id, rt_id],
-        Tags=[{"Key": "CreatedBy", "Value": "vpc-creator-api"}],
-    )
+        subnets = []
+        for s in body.subnets:
+            sub_id = ec2.create_subnet(
+                VpcId=vpc_id, CidrBlock=s.cidr, AvailabilityZone=s.availability_zone
+            )["Subnet"]["SubnetId"]
+            ec2.associate_route_table(RouteTableId=rt_id, SubnetId=sub_id)
+            subnets.append(
+                {"subnet_id": sub_id, "cidr": s.cidr, "availability_zone": s.availability_zone}
+            )
+
+        ec2.create_tags(
+            Resources=[vpc_id, igw_id, rt_id],
+            Tags=[{"Key": "CreatedBy", "Value": "vpc-creator-api"}],
+        )
+    except Exception:
+        _cleanup(ec2, vpc_id, igw_id)
+        raise
 
     return {
         "id": str(uuid.uuid4()),
@@ -268,48 +301,80 @@ def login(body: LoginRequest) -> TokenResponse:
 
 @app.post("/vpcs", status_code=201, tags=["vpcs"])
 def create_vpc(body: VPCCreate, user: User) -> dict:
-    ec2 = boto3.Session().client("ec2", region_name=body.region)
-    vpc_id = igw_id = None
-    try:
-        vpc = _build_vpc(body)
-    except ClientError as exc:
-        logger.error("AWS error creating VPC: %s", exc)
-        _cleanup(ec2, vpc_id, igw_id)
-        raise HTTPException(
-            status_code=400, detail=exc.response["Error"]["Message"]
-        )
-    database.save_vpc(vpc)
-    logger.info("VPC %s created by %s", vpc["aws_vpc_id"], user)
-    return vpc
+    with tracer.start_as_current_span("vpc.create") as span:
+        span.set_attribute("vpc.cidr", body.cidr)
+        span.set_attribute("vpc.region", body.region)
+        span.set_attribute("enduser.id", user)
+        try:
+            vpc = _build_vpc(body)
+        except ClientError as exc:
+            span.set_status(StatusCode.ERROR, exc.response["Error"]["Message"])
+            logger.error("AWS error creating VPC: %s", exc)
+            metrics_module.AWS_ERRORS.inc()
+            raise HTTPException(
+                status_code=400, detail=exc.response["Error"]["Message"]
+            )
+        except BotoCoreError as exc:
+            span.set_status(StatusCode.ERROR, str(exc))
+            logger.error("AWS connectivity error creating VPC: %s", exc)
+            metrics_module.AWS_ERRORS.inc()
+            raise HTTPException(status_code=502, detail=str(exc))
+        span.set_attribute("vpc.aws_id", vpc["aws_vpc_id"])
+        database.save_vpc(vpc)
+        database.increment_stat("vpcs_created")
+        metrics_module.VPCS_CREATED.inc()
+        metrics_module.CURRENT_VPCS.inc()
+        logger.info("VPC %s created by %s", vpc["aws_vpc_id"], user)
+        return vpc
 
 
 @app.get("/vpcs", tags=["vpcs"])
 def list_vpcs(user: User) -> list:
-    return database.list_vpcs()
+    with tracer.start_as_current_span("vpc.list") as span:
+        span.set_attribute("enduser.id", user)
+        vpcs = database.list_vpcs()
+        span.set_attribute("vpc.count", len(vpcs))
+        return vpcs
 
 
 @app.get("/vpcs/{vpc_id}", tags=["vpcs"])
 def get_vpc(vpc_id: str, user: User) -> dict:
-    vpc = database.get_vpc(vpc_id)
-    if vpc is None:
-        raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
-    return vpc
+    with tracer.start_as_current_span("vpc.get") as span:
+        span.set_attribute("vpc.id", vpc_id)
+        span.set_attribute("enduser.id", user)
+        vpc = database.get_vpc(vpc_id)
+        if vpc is None:
+            span.set_status(StatusCode.ERROR, "not found")
+            raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
+        span.set_attribute("vpc.aws_id", vpc["aws_vpc_id"])
+        return vpc
+
 
 @app.delete("/vpcs/{vpc_id}", status_code=204, tags=["vpcs"])
 def delete_vpc(vpc_id: str, user: User) -> None:
-    vpc = database.get_vpc(vpc_id)
-    if vpc is None:
-        raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
+    with tracer.start_as_current_span("vpc.delete") as span:
+        span.set_attribute("vpc.id", vpc_id)
+        span.set_attribute("enduser.id", user)
+        vpc = database.get_vpc(vpc_id)
+        if vpc is None:
+            span.set_status(StatusCode.ERROR, "not found")
+            raise HTTPException(status_code=404, detail=f"VPC '{vpc_id}' not found")
 
-    ec2 = boto3.Session().client("ec2", region_name=vpc["region"])
-    try:
-        _teardown_vpc(ec2, vpc["aws_vpc_id"], vpc["subnets"])
-    except ClientError as exc:
-        logger.error("AWS error deleting VPC %s: %s", vpc["aws_vpc_id"], exc)
-        raise HTTPException(
-            status_code=400, detail=exc.response["Error"]["Message"]
-        )
+        span.set_attribute("vpc.aws_id", vpc["aws_vpc_id"])
+        span.set_attribute("vpc.region", vpc["region"])
+        ec2 = boto3.Session().client("ec2", region_name=vpc["region"])
+        try:
+            _teardown_vpc(ec2, vpc["aws_vpc_id"], vpc["subnets"])
+        except ClientError as exc:
+            span.set_status(StatusCode.ERROR, exc.response["Error"]["Message"])
+            logger.error("AWS error deleting VPC %s: %s", vpc["aws_vpc_id"], exc)
+            raise HTTPException(
+                status_code=400, detail=exc.response["Error"]["Message"]
+            )
 
-    # Only remove from DB after AWS deletion succeeds.
-    database.delete_vpc(vpc_id)
+        # Only remove from DB after AWS deletion succeeds.
+        database.delete_vpc(vpc_id)
+        database.increment_stat("vpcs_deleted")
+        metrics_module.VPCS_DELETED.inc()
+    metrics_module.CURRENT_VPCS.dec()
     logger.info("VPC %s deleted by %s", vpc["aws_vpc_id"], user)
